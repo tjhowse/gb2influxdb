@@ -9,17 +9,24 @@ from . import version
 
 INFLUXDB_DB_NAME = "gadgetbridge"
 # TODO support any GB DB table
+METADATA_TABLE = "gb2influxdb_meta"
 GADGETBRIDGE_DB_TABLE = "MI_BAND_ACTIVITY_SAMPLE"
+
+DEFAULT_API_PARAMS = {}
+DEFAULT_API_PARAMS["precision"] = "s"
+DEFAULT_API_PARAMS["epoch"] = "s"
+DEFAULT_API_PARAMS["db"] = INFLUXDB_DB_NAME
 
 class gb2influxdb():
     def __init__(self, uri, username, password, database):
         self._uri = uri
         if not self._uri.endswith("/"):
-            self._url += "/"
+            self._uri += "/"
         self._username = username
         self._password = password
         self._database = database
-        self._last_update = 0
+        self._db_schema = self._get_gb_db_schema()
+        print(self._db_schema)
 
     def setup(self):
         try:
@@ -27,37 +34,92 @@ class gb2influxdb():
             if result['results'][0]['statement_id'] != 0:
                 raise Exception("Bad response from server: {}".format(result))
         except:
-            logging.ERROR("Failed to create gadgetbridge database.")
-        # self._do_write("{},TAG1=HI VALUE1=1 1610286963".format(GADGETBRIDGE_DB_TABLE))
-        self._get_last_influxdb_timestamp()
+            logging.error("Failed to create gadgetbridge database.")
 
+        # print(self._get_gb_db_rows(GADGETBRIDGE_DB_TABLE, 1610320440))
+        self._process_tables()
 
+    def _process_tables(self):
+        for table in self._db_schema.keys():
+            line_protocol = ''
+            if 'timestamp' != self._db_schema[table][0].lower():
+                print("Skipping syncing table {} with schema {}.".format(table, self._db_schema[table]))
+                continue
+            last_time = self._get_last_influxdb_timestamp_in_measurement(table)
+            new_rows = self._get_gb_db_rows(table, last_time)
 
-    def _get_last_influxdb_timestamp(self):
-        # This queries influxdb for the last time we wrote to the gadgetbridge database
-        result = self._do_get("SELECT VALUE1 FROM {} ORDER BY time DESC LIMIT 1".format(GADGETBRIDGE_DB_TABLE)).json()
-        # {'results': [{'series': [{'name': 'MI_BAND_ACTIVITY_SAMPLE', 'columns': ['time', 'VALUE1'], 'values': [['2021-01-10T13:56:03Z', 1]]}], 'statement_id': 0}]}
-        # read out the timestamp it's bedtime.
-        print(result)
+            for row in new_rows:
+                line_protocol += self._convert_row_to_influxdb_line(table, row)
+            # TODO Batch these max 5k
+            self._do_write(line_protocol)
+        # print(line_protocol)
 
+    def _convert_row_to_influxdb_line(self, table, row):
+        column_names = self._db_schema[table]
+        result = "{},SOURCE=GBDB ".format(table)
+        for (i, column) in enumerate(column_names):
+            if i == 0:
+                # Skip the timestamp, that goes at the end
+                continue
+            result += "{}={},".format(column, row[i])
 
-    def _do_get(self, query):
-        params = {}
+        # Strip the trailing comma.
+        result = result[:-1]
+        result += " {}\n".format(row[0])
+        return result
+
+    def _get_last_influxdb_timestamp_in_measurement(self, meas):
+        # This queries influxdb for the last timestamp we wrote to it in unix time
+        result = self._do_get("SELECT * FROM {} ORDER BY time DESC LIMIT 1".format(meas)).json()
+        try:
+            return result['results'][0]['series'][0]['values'][0][0]
+        except:
+            return 0
+
+    def _do_get(self, query, extra_params={}):
+        params = DEFAULT_API_PARAMS
         params["q"] = query
-        params["db"] = INFLUXDB_DB_NAME
+        params = {**params, **extra_params}
         return requests.get(self._uri+"query", params=params)
 
-    def _do_post(self, query):
-        params = {}
+    def _do_post(self, query, extra_params={}):
+        params = DEFAULT_API_PARAMS
         params["q"] = query
-        params["db"] = INFLUXDB_DB_NAME
+        params = {**params, **extra_params}
         return requests.post(self._uri+"query", params=params)
 
-    def _do_write(self, data):
-        params = {}
-        params["precision"] = "s"
-        params["db"] = INFLUXDB_DB_NAME
+    def _do_write(self, data, extra_params={}):
+        params = DEFAULT_API_PARAMS
+        params = {**params, **extra_params}
         return requests.post(self._uri+"write", params=params, data=data)
+
+    def _get_gb_db_schema(self):
+        db = sqlite3.connect(self._database)
+        db.text_factory = str
+        cur = db.cursor()
+        result = cur.execute("SELECT name FROM sqlite_master WHERE type='table';").fetchall()
+        table_names = sorted(list(zip(*result))[0])
+        schema = {}
+        for table_name in table_names:
+            result = cur.execute("PRAGMA table_info('%s')" % table_name).fetchall()
+            column_names = list(zip(*result))[1]
+            schema[table_name] = column_names
+        db.close()
+        if 'android_metadata' in schema:
+            schema.pop('android_metadata')
+        if 'sqlite_sequence' in schema:
+            schema.pop('sqlite_sequence')
+        return schema
+
+    def _get_gb_db_rows(self, table, time):
+        db = sqlite3.connect(self._database)
+        db.text_factory = str
+        cur = db.cursor()
+        result = cur.execute("SELECT * FROM {} WHERE timestamp > {};".format(table, time)).fetchall()
+        # rows = sorted(list(zip(*result))[0])
+        db.close()
+        return result
+
 
     def loop_forever(self):
         pass
