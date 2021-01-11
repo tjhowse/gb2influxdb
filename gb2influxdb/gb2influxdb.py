@@ -35,7 +35,7 @@ class gb2influxdb():
         self._process_tables()
 
     def _process_tables(self):
-        logging.info("Updating InfluxDB with new data.")
+        logging.info("Checking Gadgetbridge export for new data")
         self._db_update_time = self._get_file_mtime(self._database)
         db = sqlite3.connect(self._database)
         db.text_factory = str
